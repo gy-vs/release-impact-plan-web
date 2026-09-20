@@ -1,20 +1,98 @@
 import express from 'express';
 import {fileURLToPath} from 'node:url';
+import {computePlan, refinePlan} from '../shared/planner';
+import type {Graph, Plan, Seed} from '../shared/types';
+import {GraphStore, type GraphOp} from './store';
 
-type RecordRow = {id:string;name:string;revision:number;content:string;updatedAt:string};
-const rows: RecordRow[] = [
-  {id:'alpha',name:'Primary package graphs',revision:3,content:'package graphs: alpha\nstate: active',updatedAt:new Date(0).toISOString()},
-  {id:'beta',name:'Secondary package graphs',revision:5,content:'package graphs: beta\nstate: review',updatedAt:new Date(1000).toISOString()},
-];
+export function createApp(store = new GraphStore()) {
+  const app = express();
+  app.use(express.json({limit: '2mb'}));
 
-export function createApp(){
-  const app=express();
-  app.use(express.json({limit:'1mb'}));
-  app.get('/api/bootstrap',(_req,res)=>res.json({family:"release-dependency",count:rows.length}));
-  app.get('/api/plans',(_req,res)=>res.json(rows.map(({content,...row})=>row)));
-  app.get('/api/plans/:id',(req,res)=>{const row=rows.find(value=>value.id===req.params.id);if(!row)return res.status(404).json({error:'not_found'});res.set('ETag',String(row.revision)).json(row)});
-  app.put('/api/plans/:id',(req,res)=>{const row=rows.find(value=>value.id===req.params.id);if(!row)return res.status(404).json({error:'not_found'});if(req.body.revision!==row.revision)return res.status(409).json({error:'revision_conflict',current:row});row.content=String(req.body.content??'');row.revision+=1;row.updatedAt=new Date().toISOString();res.json(row)});
-  app.post('/api/plans/:id/analyze',async(req,res)=>{const row=rows.find(value=>value.id===req.params.id);if(!row)return res.status(404).json({error:'not_found'});await new Promise(resolve=>setTimeout(resolve,req.params.id==='alpha'?100:20));res.json({id:row.id,revision:row.revision,lines:String(req.body.content??row.content).split(/\r?\n/).length,diagnostics:[]})});
+  // small bounded session cache so /refine can diff against the previous plan
+  const sessionPlans = new Map<string, Plan>();
+  function rememberPlan(session: string, plan: Plan) {
+    sessionPlans.set(session, plan);
+    if (sessionPlans.size > 64) {
+      const oldest = sessionPlans.keys().next().value as string;
+      sessionPlans.delete(oldest);
+    }
+  }
+
+  app.get('/api/health', (_req, res) => res.json({ok: true, mode: 'local-simulation'}));
+
+  app.get('/api/graph', (_req, res) => {
+    res.json(store.get());
+  });
+
+  app.post('/api/graph/mutate', (req, res) => {
+    const revision = Number(req.body?.revision);
+    const ops = req.body?.ops;
+    if (!Number.isInteger(revision)) return res.status(400).json({error: 'revision_required'});
+    if (!Array.isArray(ops)) return res.status(400).json({error: 'ops_array_required'});
+    const result = store.mutate(revision, ops as GraphOp[]);
+    if (!result.ok) {
+      return res.status(result.status).json({
+        error: result.error,
+        current: result.graph,
+      });
+    }
+    res.json({graph: result.graph});
+  });
+
+  function normalizeSelections(body: any): {seeds: Seed[]; overrides: Seed[]} | {error: string} {
+    const seeds: Seed[] = [];
+    const overrides: Seed[] = [];
+    for (const raw of Array.isArray(body?.seeds) ? body.seeds : []) {
+      if (!raw || typeof raw.pkg !== 'string') return {error: 'seed_missing_pkg'};
+      const seed: Seed = {pkg: raw.pkg};
+      if (raw.version !== undefined) seed.version = String(raw.version);
+      if (raw.level !== undefined) seed.level = raw.level;
+      if (!seed.version && !seed.level) return {error: 'seed_needs_level_or_version'};
+      seeds.push(seed);
+    }
+    for (const raw of Array.isArray(body?.overrides) ? body.overrides : []) {
+      if (!raw || typeof raw.pkg !== 'string' || typeof raw.version !== 'string')
+        return {error: 'override_needs_pkg_and_version'};
+      overrides.push({pkg: raw.pkg, version: String(raw.version)});
+    }
+    return {seeds, overrides};
+  }
+
+  app.post('/api/plan', (req, res) => {
+    const expectedRevision = Number(req.body?.revision);
+    if (!Number.isInteger(expectedRevision))
+      return res.status(400).json({error: 'revision_required'});
+    if (expectedRevision !== store.revision)
+      return res.status(409).json({error: 'revision_conflict', current: store.get()});
+    const selection = normalizeSelections(req.body);
+    if ('error' in selection) return res.status(400).json({error: selection.error});
+
+    const graph = store.get();
+    const plan = computePlan(graph, selection.seeds, selection.overrides);
+    const session = typeof req.body?.session === 'string' ? req.body.session : 'default';
+    rememberPlan(session, plan);
+    res.json({plan});
+  });
+
+  app.post('/api/refine', (req, res) => {
+    const expectedRevision = Number(req.body?.revision);
+    if (!Number.isInteger(expectedRevision))
+      return res.status(400).json({error: 'revision_required'});
+    if (expectedRevision !== store.revision)
+      return res.status(409).json({error: 'revision_conflict', current: store.get()});
+    const selection = normalizeSelections(req.body);
+    if ('error' in selection) return res.status(400).json({error: selection.error});
+
+    const session = typeof req.body?.session === 'string' ? req.body.session : 'default';
+    const prev = sessionPlans.get(session) ?? null;
+    const result = refinePlan(prev, store.get(), selection.seeds, selection.overrides);
+    rememberPlan(session, result.plan);
+    res.json({...result, session});
+  });
+
   return app;
 }
-if(process.argv[1]===fileURLToPath(import.meta.url)){createApp().listen(4174,'127.0.0.1',()=>console.log('server http://127.0.0.1:4174'))}
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  createApp().listen(4174, '127.0.0.1', () => console.log('server http://127.0.0.1:4174'));
+}
